@@ -2,3 +2,6 @@
 sandbox/
 node_modules/
 .DS_Store
+
+# 本地推送指引，可能含 token，绝不提交
+推送指南.md
