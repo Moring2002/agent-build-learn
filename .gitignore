@@ -1,0 +1,4 @@
+# 演示沙箱是每次生成的，不进版本库
+sandbox/
+node_modules/
+.DS_Store

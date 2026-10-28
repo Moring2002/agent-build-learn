@@ -1,0 +1,16 @@
+{
+  "name": "agent-studio",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "零依赖的最小本地 agent：Ollama + 工具调用闭环",
+  "scripts": {
+    "seed": "node scripts/seed.js",
+    "seed:reset": "node scripts/seed.js --reset",
+    "start": "node src/cli.js",
+    "demo": "node scripts/seed.js --reset && node src/cli.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
