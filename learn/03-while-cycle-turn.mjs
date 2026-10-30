@@ -1,9 +1,36 @@
+// 03-while-cycle-turn.mjs
+// 演示 Agent 的「多轮工具调用循环」：
+//   用户提问 → 模型决定调用哪些工具 → 本地执行工具 → 结果回填对话 → 再次询问模型 → …… → 模型给出最终文本回答
+// 关键点是 while 循环：只要模型还在申请工具调用，循环就继续；模型改为输出文本时，循环结束。
+
+// ===== 1. 工具声明（schema）=====
+// 这部分只描述「有哪些工具、参数长什么样」，交给模型看，不含任何执行逻辑。
+// 模型据此决定要不要调用、以及按什么参数调用。
 const tools = [
     {
         type: "function",
         function: {
             name: "get_weather",
-            description: "获取用户指定位置的天气信息",
+            description: "获取用户指定位置的天气信息，支持城市有: 东京、北京、上海",
+            // parameters 是 JSON Schema：属性名和 required 列表要和函数实现里的取值对应
+            parameters: {
+                type: "object",
+                properties: {
+                    city: {
+                        type: "string",
+                        description: "城市名称",
+                    }
+                },
+                required: ["city"]
+            }
+        }
+    },
+    {
+        type: "function",
+        function: {
+            name: "get_time",
+            description: "获取用户指定位置的时间信息，支持城市有: 北京",
+            // parameters 是 JSON Schema：属性名和 required 列表要和函数实现里的取值对应
             parameters: {
                 type: "object",
                 properties: {
@@ -18,30 +45,75 @@ const tools = [
     }
 ];
 
+// ===== 2. 工具的真实实现 =====
+// 用一张写死的表冒充天气接口，便于专注调试「调用循环」本身而不是网络。
 const table = {
     东京: { temp: 21, condition: "多云" },
     北京: { temp: 18, condition: "晴" },
     上海: { temp: 25, condition: "小雨" },
 }
 
+// 查不到城市时不抛错，而是返回 error 对象：
+// 错误信息会作为工具结果一起回给模型，模型可以据此改参数重试或向用户说明情况。
 function fakeWeather(cityName) {
-    return table[cityName] ?? { error: "支持的城市有: 东京、北京、上海" }
+    return table[cityName] ?? { error: `不支持的城市:${cityName}，支持的城市有: 东京、北京、上海` }
 }
 
+// 第二个工具：查时间。目前只支持北京，用于演示「多工具」时分派。
 function getTime(cityName) {
-    return cityName === "北京" ? { city: cityName, time: new Date().toLocaleTimeString(), timezone: "UTC+8" } : { error: "目前仅支持查询北京" };
+    return cityName === "北京" ? { city: cityName, time: new Date().toLocaleTimeString(), timezone: "UTC+8" } : { error: `不支持的城市:${cityName}，目前仅支持查询北京` };
 }
 
-function runTool(tool_name, arguments) {
-    
-}
-const messages = [{ role: "user", content: "哪里在下雨" }];
+const HANDLERS = { get_weather: fakeWeather, get_time: getTime };
 
+// 统一入口：把「模型给的工具名 + 参数」分派到具体函数，避免调用处写满 if 判断。
+// 注意参数名不能叫 arguments —— .mjs 是 ES 模块，默认严格模式，arguments 是保留字。
+function runTool(tool_name, tool_arguments) {
+    const handler = HANDLERS[tool_name];
+    // 第 1 层：工具存在吗？—— 必须在取参数之前，否则参数检查会盖住这个错误
+    if (!handler) {
+        const names = tools.map((tool) => tool.function.name)
+        return { error: `未知工具 ${tool_name}。可用：${names.join(", ")}` };
+    }
+
+    // 第 2 层：参数形状对吗？模型可能漏传、传错类型、或者用错字段名
+    const city = tool_arguments?.city;
+    if (typeof city !== "string" || city.trim() === "") {
+        return { error: `city 必须是非空字符串，收到的是 ${JSON.stringify(city)}` };
+    }
+
+    // 第 3 层：值在范围内吗？—— 交给工具自己判断（它才知道支持哪些城市）
+    return HANDLERS[tool_name](city.trim());
+}
+
+// 把工具结果格式化成一行简短摘要，只给调试日志用，不参与回传给模型的数据。
+// 按工具名分支，避免把天气字段当成所有工具的通用字段；新增工具时在这里补一个分支即可。
+function formatResultSummary(tool_name, result) {
+    if (result.error) {
+        return result.error;
+    }
+    if (tool_name === "get_weather") {
+        return `${result.temp}°C ${result.condition}`;
+    } else if (tool_name === "get_time") {
+        return `${result.time} ${result.timezone}`;
+    } else {
+        return JSON.stringify(result);
+    }
+}
+
+// ===== 3. 对话历史 =====
+// messages 是唯一的「状态」：每轮都把新消息追加进来，所以模型能看到之前的工具结果。
+// 只放一条 user 消息，剩下的都由循环动态累积。
+const messages = [{ role: "user", content: "上海在下雨吗,北京现在几点？能知道北京的时区吗，广州天气怎么样" }];
+
+// step：已进行的轮数；answer：最终文本答案；finished：是否正常结束（区别于撞上轮数上限）。
 let step = 0;
 let answer = "";
 let finished = false;
 
+// 上限 10 轮是硬性保险：防止模型反复申请工具导致死循环。
 while (step < 10) {
+    // ---- 3.1 请求模型：带上完整历史 + 全部工具声明 ----
     const res = await fetch("http://localhost:11434/api/chat", {
         method: "POST",
         headers: {
@@ -51,12 +123,13 @@ while (step < 10) {
             model: "qwen3.5:4b-mlx",
             messages: messages,
             tools: tools,
-            stream: false,
-            think: false,
-            options: { num_ctx: 4096, temperature: 0 },
+            stream: false,   // 关掉流式，直接拿完整响应，便于观察 tool_calls 结构
+            think: false,    // 关掉思考输出，避免混入推理内容干扰调试
+            options: { num_ctx: 4096, temperature: 0 },  // temperature 0：让同样的输入尽量得到同样的调用决策
         }),
     })
 
+    // HTTP 层先判错：模型没启动/请求体格式不对时，不必再去解析 JSON
     if (!res.ok) {
         console.error("Error:", res.status, res.statusText);
         process.exit(1);
@@ -64,43 +137,64 @@ while (step < 10) {
 
     const data = await res.json();
 
+    // ---- 3.2 判断模型是「要调工具」还是「已给出答案」 ----
+    // 模型没有调用工具时，Ollama 不返回 tool_calls 字段（值是 undefined），所以必须先判空。
     const tool_calls = data.message.tool_calls;
     console.log('tool_calls:', tool_calls);
+    // 逐个打印参数：console.log 默认只展开一层对象，arguments 会显示成 [Object]，
+    // 用 JSON.stringify 才能看到实际字段，用来确认参数路径是 message.tool_calls[].function.arguments。
     if (tool_calls && tool_calls.length > 0) {
         for (const call of tool_calls) {
             console.log('arguments:', JSON.stringify(call.function.arguments));
         }
     }
 
+    // 没有工具调用 = 模型认为信息已足够，本轮 content 就是最终答案，退出循环。
     if (!tool_calls || tool_calls.length === 0) {
         answer = data.message.content;
         finished = true;
         break;
     }
-    const results = tool_calls.map((call) => {
-        tool_name: fakeWeather(call.function.arguments.city)
-        resule: 
-    })
-    console.log('results:', results);
 
+    // ---- 3.3 执行工具，并把结果回填进对话 ----
+    // 先把模型这条「我要调用工具」的 assistant 消息原样存入历史；
+    // 这一步不能省：工具结果必须紧跟在发起调用的那条 assistant 消息之后，否则对话结构不合法。
     messages.push(data.message);
-    for (const result of results) {
+
+    // 一次循环同时完成「执行」和「回填」，保证每个工具只被执行一遍。
+    // results 与 tool_calls 顺序一一对应，仅用于后面打印。
+    const results = [];
+    for (const call of tool_calls) {
+        const result = runTool(call.function.name, call.function.arguments);
+        results.push(result);
         messages.push({
             role: "tool",
-            tool_name: "get_weather",
-            content: JSON.stringify(result)
+            tool_name: call.function.name,   // 标明这条结果来自哪个工具（多工具并行调用时需要）
+            content: JSON.stringify(result)   // content 必须是字符串，所以把结果序列化
         })
     }
+    console.log('results:', results);
 
-    console.log(`[第 ${step + 1} 轮] 申请 ${tool_calls.length} 个: ${tool_calls.map(c => c.function.arguments.city).join('、')}`);
-    console.log(`[第 ${step + 1} 轮] 返回: ${results.map(r => r.error ? r.error : `${r.temp}°C ${r.condition}`).join(', ')}`);
+    // ---- 3.4 打印本轮概览，然后进入下一轮 ----
+    // results 与 tool_calls 下标一一对应，所以按下标取值：这样能同时拿到工具名和结果。
+    // 成功与失败都带工具名/城市前缀，多个调用挤在一行时才能分得清哪条对应哪个。
+    const summaries = tool_calls.map((call, index) => {
+        const summary = formatResultSummary(call.function.name, results[index]);
+        if (results[index].error) {
+            return `${call.function.name}(${call.function.arguments.city}) 失败: ${summary}`;
+        } else {
+            return `${call.function.name}(${call.function.arguments.city}) ${summary}`;
+        }
+    });
+    console.log(`[第 ${step + 1} 轮] ${summaries.join(' | ')}`);
 
     step++;
 }
 
+// ===== 4. 出口 =====
+// finished 为 false 说明是撞上 10 轮上限退出的，此时 messages 已攒了一堆工具结果但没有最终回答。
 if (finished) {
     console.log("最终答案:", answer);
 } else {
     console.log("未完成");
 }
-
