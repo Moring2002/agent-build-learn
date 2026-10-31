@@ -8,14 +8,28 @@
 
 ```bash
 ollama serve                  # 确保在跑
-npm run demo                  # 重建沙箱 + 跑 agent
+npm run demo                  # 重建沙箱 + 跑 agent（跑一次就退出）
 ```
+
+交互模式（推荐学习用）：不带任务参数启动就进入 REPL，输入任务回车运行，跑完还能翻看完整对话。
+
+```bash
+npm start                     # 进入交互模式
+task › 把沙箱里的文件整理归类好
+task › /messages              # 查看上一次运行的完整对话（system/user/assistant/tool 逐条列出）
+task › /sandbox               # 查看沙箱当前文件
+task › /help                  # 全部命令
+task › /quit                  # 退出（Ctrl+C 同效）
+```
+
+每个任务都是独立的一次运行（新的 messages 数组）。`/messages` 展示的就是每轮发给模型的那个数组——看 agent 在干嘛，先看它。
 
 换模型、调步数：
 
 ```bash
 npm run seed:reset
-npm start -- --model qwen3.5:9b-mlx --steps 15
+npm start -- --model qwen3.5:9b-mlx --steps 15        # 带这些配置进入交互模式
+npm start -- --model qwen3.5:9b-mlx --steps 15 "把沙箱里的文件整理归类好"  # 跑一次就退出
 ```
 
 自定义任务：
@@ -31,8 +45,8 @@ npm start -- "把 PDF 和收据移到 finance/，代码移到 code/，其余你�
 src/
   ollama.js    /api/chat 的最薄封装（num_ctx、think:false、temperature）
   tools.js     工具定义 + schema 校验 + 沙箱守卫 + checkState 完成校验
-  agent.js     agent 循环 + 三个护栏
-  cli.js       命令行入口 + 可读执行轨迹
+  agent.js     agent 引擎（通用）：循环 + 护栏；任务规则/工具/完工校验由调用方注入
+  cli.js       CLI 入口：REPL + /messages 查看；在这里组装 agent（prompt、tools、onFinish）
 scripts/
   seed.js      造演示沙箱（含无扩展名、二进制、隐藏文件）
 sandbox/       所有文件操作的唯一作用域
@@ -51,6 +65,8 @@ loop:
   → 若调用 finish 且通过校验 → 结束
   → 否则继续
 ```
+
+`runAgent` 是通用引擎：`systemPrompt`（任务规则）、`tools`（广告给模型的工具清单）、`onFinish`（完工事实校验）都由调用方注入，组装见 `cli.js` 顶部。换一套注入就是另一个 agent。
 
 没有魔法。框架（LangGraph、Pydantic AI、smolagents）做的事本质也是这个循环，外加状态管理和可观测性。
 

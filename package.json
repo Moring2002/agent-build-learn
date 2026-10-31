@@ -8,7 +8,7 @@
     "seed": "node scripts/seed.js",
     "seed:reset": "node scripts/seed.js --reset",
     "start": "node src/cli.js",
-    "demo": "node scripts/seed.js --reset && node src/cli.js"
+    "demo": "node scripts/seed.js --reset && node src/cli.js \"把沙箱里的文件整理归类好\""
   },
   "engines": {
     "node": ">=20"

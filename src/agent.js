@@ -1,26 +1,19 @@
-// Agent 核心循环。整个"智能"就藏在这几十行里：
+// Agent 核心引擎。整个"智能"就藏在这几十行里：
 //   发给模型 → 它要调工具 → 我们执行并把结果塞回对话 → 再发给模型 → 直到它调 finish
 //
-// 小模型上真正决定成败的是三个护栏，不是提示词写得多漂亮：
-//   1. 参数校验：模型给的参数永远当不可信输入
+// 本文件是通用引擎，不认识任何具体任务：任务规则(systemPrompt)、发给模型的工具清单(tools)、
+// 完工校验(onFinish)都由调用方注入——换一套注入就是另一个 agent（组装在 cli.js）。
+// 注意：工具的真正执行仍走 tools.js 的 callTool 分发，所以"能执行哪些工具"注册在 tools.js，
+// tools 参数只决定"把哪些工具广告给模型"。两个清单目前一致，工具变多再考虑拆注册表。
+//
+// 小模型上真正决定成败的是护栏，不是提示词写得多漂亮：
+//   1. 参数校验：模型给的参数永远当不可信输入（tools.js 的 callTool）
 //   2. 重复检测：它会在同一个错误上打转，必须主动打断
 //   3. 步数上限：防止无限循环烧时间
+//   4. finish 必须过 onFinish 的事实校验才算数（由调用方注入）
 
 import { chat, DEFAULT_MODEL } from './ollama.js';
-import { TOOL_SPECS, callTool, TOOL_NAMES, checkState } from './tools.js';
-
-const SYSTEM_PROMPT = `你是一个文件整理 agent，在沙箱目录内工作。
-
-规则：
-1. 所有路径都是相对沙箱根目录的写法，根目录用 "."。
-2. 先 list_files 看清有什么，再动手。
-3. 无扩展名或含义不明的文件，必须先用 read_file 看内容再决定放哪。
-4. 用 move_file 移动到分类子目录，路径写成 "分类/文件名"（目录会自动创建）。
-5. 不要移动已经归好类的文件。隐藏文件（以 . 开头，尤其是 .env）必须留在根目录，绝对不要移动或改名。
-6. 全部完成后调用 finish，summary 里逐个列出每个分类下有哪些文件。
-7. 目标：根目录最后只剩分类子目录，所有非隐藏文件都要移走。不要只在 summary 里描述，必须真的移动。
-
-直接调用工具，不要输出解释性长文。`;
+import { callTool } from './tools.js';
 
 const MAX_STEPS = 12;
 const REPEAT_LIMIT = 2;
@@ -43,20 +36,18 @@ function normalizeCalls(raw = []) {
   });
 }
 
-const brief = (value, max = 160) => {
-  const s = typeof value === 'string' ? value : JSON.stringify(value);
-  return s.length > max ? `${s.slice(0, max)}…` : s;
-};
-
 export async function runAgent({
   task,
+  systemPrompt,
+  tools,
+  onFinish = null,
   model = DEFAULT_MODEL,
   maxSteps = MAX_STEPS,
   numCtx = 16384,
   onEvent = () => {},
 }) {
   const messages = [
-    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'system', content: systemPrompt },
     { role: 'user', content: task },
   ];
 
@@ -65,7 +56,7 @@ export async function runAgent({
   let totalOutput = 0;
 
   for (let step = 1; step <= maxSteps; step++) {
-    const { message, stats } = await chat({ model, messages, tools: TOOL_SPECS, numCtx });
+    const { message, stats } = await chat({ model, messages, tools, numCtx });
     totalOutput += stats.outputTokens;
 
     const content = (message.content ?? '').trim();
@@ -83,6 +74,7 @@ export async function runAgent({
         steps: step,
         trace,
         totalOutput,
+        messages,
         note: '模型没有调用任何工具就结束了（未调用 finish）',
       };
     }
@@ -98,22 +90,9 @@ export async function runAgent({
     });
 
     for (const call of calls) {
-      // --- finish：正常出口，但必须先通过事实校验 ---
+      // --- finish：正常出口，但必须先通过调用方注入的事实校验 ---
       if (call.name === 'finish') {
-        const { unclassified, protectedMissing } = await checkState();
-        const problems = [];
-        if (unclassified.length > 0) {
-          problems.push(
-            `根目录还有 ${unclassified.length} 个非隐藏文件没归类（${unclassified.join('、')}）。请继续处理，把根目录清空后再调用 finish。`,
-          );
-        }
-        if (protectedMissing.length > 0) {
-          problems.push(
-            `受保护的隐藏文件被移动或删除了：${protectedMissing.join(
-              '、',
-            )}。必须把它移回根目录，隐藏文件不允许移动。`,
-          );
-        }
+        const problems = onFinish ? await onFinish(call.args) : [];
 
         if (problems.length > 0) {
           const error = `finish 被拒绝：${problems.join(' ')}`;
@@ -136,6 +115,7 @@ export async function runAgent({
           steps: step,
           trace,
           totalOutput,
+          messages,
         };
       }
 
@@ -185,6 +165,7 @@ export async function runAgent({
     steps: maxSteps,
     trace,
     totalOutput,
+    messages,
   };
 }
 
@@ -194,5 +175,3 @@ function shortResult(result) {
   }
   return result;
 }
-
-export { TOOL_NAMES, brief };
