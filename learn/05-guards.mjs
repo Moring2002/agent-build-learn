@@ -101,19 +101,11 @@ function formatResultSummary(tool_name, result) {
     }
 }
 
-// ===== 3. 对话历史 =====
-// messages 是唯一的「状态」：每轮都把新消息追加进来，所以模型能看到之前的工具结果。
-// 只放一条 user 消息，剩下的都由循环动态累积。
-const messages = [{ role: "user", content: "上海在下雨吗,北京现在几点？能知道北京的时区吗，广州天气怎么样" }];
-
-// step：已进行的轮数；answer：最终文本答案；finished：是否正常结束（区别于撞上轮数上限）。
-let step = 0;
-let answer = "";
-let finished = false;
-
-// 上限 10 轮是硬性保险：防止模型反复申请工具导致死循环。
-while (step < 10) {
-    // ---- 3.1 请求模型：带上完整历史 + 全部工具声明 ----
+// ===== 3. 模型请求封装 =====
+// 把「怎么问模型」从调用循环里抽出来：循环只关心「拿到回答后干什么」，
+// 请求地址、模型名、采样参数这些配置改动时只需动这一处。
+// 参数用调用处同名变量直接传入（messages / tools 在下方定义），不再重复声明常量。
+async function askModel(messages, tools) {
     const res = await fetch("http://localhost:11434/api/chat", {
         method: "POST",
         headers: {
@@ -135,7 +127,28 @@ while (step < 10) {
         process.exit(1);
     }
 
+    // 直接返回解析好的响应体，调用处拿到的就是 { message: ... } 结构，不用再关心 res/data 两层
     const data = await res.json();
+    return data;
+}
+
+// ===== 4. 对话历史 =====
+// messages 是唯一的「状态」：每轮都把新消息追加进来，所以模型能看到之前的工具结果。
+// 只放一条 user 消息，剩下的都由循环动态累积。
+const messages = [{ role: "user", content: "北京天气怎么样？" }];
+
+// step：已进行的轮数；answer：最终文本答案；finished：是否正常结束（区别于撞上轮数上限）。
+let step = 0;
+let answer = "";
+let stopped = null;
+let maxSteps = 10;
+
+const seen = new Map();
+
+// 上限 10 轮是硬性保险：防止模型反复申请工具导致死循环。
+while (step < maxSteps) {
+    // ---- 3.1 请求模型：带上完整历史 + 全部工具声明 ----
+    const data = await askModel(messages, tools);
 
     // ---- 3.2 判断模型是「要调工具」还是「已给出答案」 ----
     // 模型没有调用工具时，Ollama 不返回 tool_calls 字段（值是 undefined），所以必须先判空。
@@ -152,7 +165,7 @@ while (step < 10) {
     // 没有工具调用 = 模型认为信息已足够，本轮 content 就是最终答案，退出循环。
     if (!tool_calls || tool_calls.length === 0) {
         answer = data.message.content;
-        finished = true;
+        stopped = "finished";
         break;
     }
 
@@ -164,7 +177,25 @@ while (step < 10) {
     // 一次循环同时完成「执行」和「回填」，保证每个工具只被执行一遍。
     // results 与 tool_calls 顺序一一对应，仅用于后面打印。
     const results = [];
+    const nudges = [];
     for (const call of tool_calls) {
+
+        const tool_name = call.function.name;
+        const args = call.function.arguments ?? {};
+        const key = `${tool_name}:${JSON.stringify(args)}`;
+        const count = (seen.get(key) ?? 0) + 1;
+        seen.set(key, count);
+
+        if (count > 3) {
+            stopped = "repeated";
+            break;
+        }
+
+        if (count === 2) {
+            nudges.push(`你尝试用${tool_name}这个完全相同的参数${count}次了，请换一个参数再试`);
+        }
+
+
         const result = runTool(call.function.name, call.function.arguments);
         results.push(result);
         messages.push({
@@ -173,6 +204,7 @@ while (step < 10) {
             content: JSON.stringify(result)   // content 必须是字符串，所以把结果序列化
         })
     }
+
     console.log('results:', results);
 
     // ---- 3.4 打印本轮概览，然后进入下一轮 ----
@@ -188,13 +220,23 @@ while (step < 10) {
     });
     console.log(`[第 ${step + 1} 轮] ${summaries.join(' | ')}`);
 
+    if (stopped === "repeated") break;
+
+    for (const n of nudges) {
+        messages.push({ role: "user", content: n });
+    }
+
     step++;
+    if (stopped === null) stopped = "max_steps";
 }
 
-// ===== 4. 出口 =====
-// finished 为 false 说明是撞上 10 轮上限退出的，此时 messages 已攒了一堆工具结果但没有最终回答。
-if (finished) {
-    console.log("最终答案:", answer);
-} else {
-    console.log("未完成");
+// ===== 5. 出口 =====
+let finalAnswer = answer;
+if (stopped !== "finished") {
+    messages.push({ role: "user", content: `停止原因：${stopped}，基于messages尽力回答，信息不足的地方说明缺了什么` });
+    const last = await askModel(messages, null);
+    finalAnswer = last.message.content;
 }
+
+console.log(finalAnswer);
+if (stopped !== "finished") process.exit(1);
